@@ -6,39 +6,93 @@ This document serves as a guide for how to derive the RBAC necessary to install 
 
 ### Required RBAC
 
-You can determine the specifics of the permissions required by your ClusterExtension by referencing the bundle of the ClusterExtension you want to install. The service account must have the following permissions:
+The required permissions for the installation and management of a cluster extension can be determined by examining the contents of its bundle image.
+This bundle image contains all the manifests that make up the extension (e.g. `CustomResourceDefinition`s, `Service`s, `Secret`s, `ConfigMap`s, etc.), 
+as well as a [`ClusterServiceVersion`](https://olm.operatorframework.io/docs/concepts/crds/clusterserviceversion/) (CSV) that describes the extension and its service account's permission requirements.
 
-The service account should be bound to one ClusterRole, defining the permissions for cluster-scoped resources and cluster-wide namespace scoped resources.
+The service account must have permissions to:
+ - create and manage the extension's `CustomResourceDefinition`s
+ - create and manage the resources in packaged in the bundle
+ - grant the extension controller's service account the permissions it requires for its operation
+ - create and manage the extension controller's service account
+ - create and manage the `Role`s, `RoleBinding`s, `ClusterRole`s, and `ClusterRoleBinding`s associated with the extension controller's service account
+ - create and manage the extension controller's deployment
+
+Additionally, for clusters that use the [OwnerReferencesPermissionEnforcement](https://kubernetes.io/docs/reference/access-authn-authz/admission-controllers/#ownerreferencespermissionenforcement) admission plug-in, the service account must also have permissions to:
+ - update finalizers on the ClusterExtension to be able to set blockOwnerDeletion and ownerReferences
+
+It is good security practice to follow the [principle of least privilege(https://en.wikipedia.org/wiki/Principle_of_least_privilege)], and scope permissions to specific resource names, wherever possible.
+Keep in mind, that it is not possible to scope `create`, `list`, and `watch` permissions to specific resource names.
+
+Depending on the scope, each permission will need to be added to either a `ClusterRole` or a `Role` and then bound to the service account with a `ClusterRoleBinding` or a `RoleBinding`.
+
+### Example
+
+The following example illustrates the process of deriving the minimal RBAC required to install the [ArgoCD Operator](https://operatorhub.io/operator/argocd-operator) v0.6.0 provided by [OperatorHub.io](https://operatorhub.io/).
+The final permission set can be found in the [ClusterExtension sample manifest](../../config/samples/olm_v1alpha1_clusterextension.yaml) in the [samples](../../config/samples/olm_v1alpha1_clusterextension.yaml) directory.
+
+The bundle image for the ArgoCD Operator v0.6.0 can be sourced from [quay.io/operatorhubio/argocd-operator:v0.6.0](https://quay.io/operatorhubio/argocd-operator:v0.6.0).
+
+The bundle includes the following content:
+
+* `ClusterServiceVersion`:
+  - argocd-operator.v0.6.0.clusterserviceversion.yaml
+* `CustomResourceDefinition`s:
+  - argoproj.io_applicationsets.yaml
+  - argoproj.io_applications.yaml
+  - argoproj.io_appprojects.yaml
+  - argoproj.io_argocdexports.yaml
+  - argoproj.io_argocds.yaml
+* Additional resources:
+  - argocd-operator-controller-manager-service_v1_service.yaml
+  - argocd-operator-controller-manager-metrics-service_v1_service.yaml
+  - argocd-operator-manager-config_v1_configmap.yaml
+  - argocd-operator-metrics-reader_rbac.authorization.k8s.io_v1_clusterrole.yaml
+
+The `ClusterServiceVersion` defines a single `Deployment` in `spec.install.deployments` named `argocd-operator-controller-manager` with a `ServiceAccount` of the same name.
+It declares the following cluster-scoped permissions in `spec.install.clusterPermissions`, and its namespace-scoped permissions in `spec.install.permissions`.
+
+#### Derive permissions for the installer service account `ClusterRole`
+
+##### Step 1. RBAC creation and management permissions
+
+The installer service account must create and manage the `ClusterRole`s and `ClusterRoleBinding`s for the extension controller(s). 
+Therefore, it must have the following permissions:
+
+```yaml
+- apiGroups: [rbac.authorization.k8s.io]
+  resources: [clusterroles]
+  verbs: [create, list, watch]
+- apiGroups: [rbac.authorization.k8s.io]
+  resources: [clusterroles]
+  verbs: [get, update, patch, delete]
+  resourceNames: [<controller cluster role name>]
+```
+
+Note: The `resourceNames` field should be populated with the names of the `ClusterRole`s created by OLM v1. 
+The names are generated and have the following format: `<packageName>.<hash>`. Since it is not a trivial task
+to generate these names ahead of time, it is recommended to use a wildcard `*` in the `resourceNames` field for the installation.
+Once the `ClusterRole`s are created, the cluster can be queried for the generated names and the `resourceNames` field can be updated accordingly.
+
+##### Step 2. `ClusterResourceDefinition` permissions
+
+The installer service account must be able to create and manage the `CustomResourceDefinition`s for the extension, as well 
+as grant the extension controller's service account the permissions it needs to manage its CRDs.
+
+```yaml
+- apiGroups: [apiextensions.k8s.io]
+  resources: [customresourcedefinitions]
+  verbs: [create, list, watch]
+- apiGroups: [apiextensions.k8s.io]
+  resources: [customresourcedefinitions]
+  verbs: [get, update, patch, delete]
+  # Scoped to the CRDs in the bundle
+  resourceNames: [applications.argoproj.io, appprojects.argoproj.io, argocds.argoproj.io, argocdexports.argoproj.io, applicationsets.argoproj.io]
+```
+
+etc.
 
 
-* Create, list, watch verbs for all resources that are a part of the install (cannot be scoped to specific resource names).
-  - Permissions to create and manage CustomResourceDefinitions
-  - Permissions to create any other manifest objects
-  - Rules to manage any other cluster-scoped resources
-  - All the rules defined in the CSV under `.spec.install.clusterPermissions`.
-  - Permissions for namespace-scoped resources.
-  - These are specified with ClusterRole + ClusterRoleBinding, ClusterRole + RoleBinding, or Role + RoleBinding.
-
-* Permissions to create any ClusterRole, ClusterRoleBinding, Role, RoleBinding resources required by the extension.
-  - All the same rules defined in the ClusterRole and Role resources
-  - Escalate and bind verbs for ClusterRole, ClusterRoleBinding, Role, RoleBinding resources
-  - Permissions to create the necessary roles and rolebindings for the controller to be able to perform its job
-
-
-The service account should be bound to a Role to define the permissions for the service account within the installation namespace.
-
-* Get, update, patch, delete verbs for all resources that are a part of the install (can be scoped to specific resource names)
-  - Permissions for non cluster-scoped resources
-  - Permissions for namespace-scoped resources
-   - All the rules defined in the CSV under `.spec.install.permissions`.
-  - These are created using ClusterRole + ClusterRoleBinding, ClusterRole + RoleBinding, or Role + RoleBinding
-
-* Update finalizers on the ClusterExtension to be able to set blockOwnerDeletion and ownerReferences.
-
-* Permissions to create the controller deployment, this corresponds to the rules to manage the
-  deployment defined in the ClusterServiceVersion.
-
-### Example to derive RBAC
 
 As an example, consider a ClusterExtension that has the following permissions defined in the `.spec.install.clusterPermissions` and `.spec.install.permissions` as part of its ClusterServiceVersion definition.
 
